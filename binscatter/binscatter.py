@@ -1,12 +1,11 @@
 """Monkey-patch Matplotlib to add an 'ax.binscatter' method."""
 import warnings
-from typing import Dict, Iterable, List, Optional, Tuple
-
+from typing import Dict, Iterable, List, Optional, Tuple, Union
+from sklearn import linear_model
+from sklearn.preprocessing import PolynomialFeatures
 import matplotlib
 import numpy as np
 import numpy.typing as npt
-from sklearn import linear_model
-
 
 def _get_bins(n_elements: int, n_bins: int) -> List[slice]:
     bin_edges = np.linspace(0, n_elements, n_bins + 1).astype(int)
@@ -15,56 +14,92 @@ def _get_bins(n_elements: int, n_bins: int) -> List[slice]:
 
 
 def get_binscatter_objects(
-    y: np.ndarray,
-    x: np.ndarray,
-    controls,
-    n_bins: int,
-    recenter_x: bool,
-    recenter_y: bool,
-    bins: Optional[Iterable],
-) -> Tuple[List[float], List[float], float, float]:
-    """
-    Returns mean x and mean y within each bin, and coefficients if residualizing.
-    Parameters are essentially the same as in binscatter.
-    """
-    # Check if data is sorted
+    x: pd.Series,
+    y: pd.Series,
+    controls: Union[pd.Series, pd.DataFrame] = None,
+    weights: pd.Series = None,
+    plot_fit = False,
+    degree = 1,
+    n_bins = 20,
+    recenter_x = True,
+    recenter_y = True,
+    bins = None
+):
+
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if weights is None:
+        weights = [1] * len(x)
+    weights = np.asarray(weights)
 
     if controls is None:
         if np.any(np.diff(x) < 0):
             argsort = np.argsort(x)
             x = x[argsort]
             y = y[argsort]
+            weights = weights[argsort]
         x_data = x
         y_data = y
     else:
-        # Residualize
         if np.ndim(controls) == 1:
             controls = np.expand_dims(controls, 1)
 
-        demeaning_y_reg = linear_model.LinearRegression().fit(controls, y)
+        demeaning_y_reg = linear_model.LinearRegression().fit(controls, y, weights)
         y_data = y - demeaning_y_reg.predict(controls)
 
-        demeaning_x_reg = linear_model.LinearRegression().fit(controls, x)
+        demeaning_x_reg = linear_model.LinearRegression().fit(controls, x, weights)
         x_data = x - demeaning_x_reg.predict(controls)
         argsort = np.argsort(x_data)
         x_data = x_data[argsort]
         y_data = y_data[argsort]
+        weights = weights[argsort]
 
         if recenter_y:
-            y_data += np.mean(y)
+            y_data += np.average(y, weights = weights)
         if recenter_x:
-            x_data += np.mean(x)
+            x_data += np.average(x, weights = weights)
 
+    # this shouldn't be necessary
     if x_data.ndim == 1:
         x_data = x_data[:, None]
-    reg = linear_model.LinearRegression().fit(x_data, y_data)
+    if y_data.ndim == 1:
+        y_data = y_data[:, None]
+    if weights.ndim == 1:
+        wts_reshape = weights[:, None]
+    
     if bins is None:
-        bins = _get_bins(len(y), n_bins)
+        bins = get_bins(len(y), n_bins)
 
-    x_means = [np.mean(x_data[bin_]) for bin_ in bins]
-    y_means = [np.mean(y_data[bin_]) for bin_ in bins]
+    x_means = [np.average(x_data[bin_i], weights = wts_reshape[bin_i]) for bin_i in bins]
+    y_means = [np.average(y_data[bin_i], weights = wts_reshape[bin_i]) for bin_i in bins]
 
-    return x_means, y_means, reg.intercept_, reg.coef_[0]
+    if plot_fit:
+        
+        X_poly = PolynomialFeatures(degree = degree).fit_transform(x_data)
+        if controls is None:
+            X_mat = X_poly
+        else:
+            X_mat = np.concatenate((X_poly, controls), axis = 1)
+        
+        reg = linear_model.LinearRegression().fit(X_mat, y_data, weights)
+        reg_coefs = [reg.intercept_[0]] + reg.coef_[0, 1:degree+1].tolist()
+        
+        x_curve = np.linspace(min(x_means), max(x_means))
+        y_curve = np.sum([reg_coefs[n] * np.power(x_curve, n) for n in range(degree + 1)], axis = 0)
+        
+        return {
+            'x_means' : x_means,
+            'y_means' : y_means,
+            'reg_coefs' : reg_coefs,
+            'x_curve' : x_curve,
+            'y_curve' : y_curve
+        }
+
+    else:
+        return {
+            'x_means' : x_means,
+            'y_means' : y_means,
+        }
 
 
 def binscatter(
